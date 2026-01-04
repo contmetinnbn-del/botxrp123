@@ -24,9 +24,12 @@ import json
 import logging
 import os
 import re
+
+
 def _safe_client_order_id(s: str, max_len: int = 36) -> str:
-    s = re.sub(r'[^A-Za-z0-9_-]', '', str(s))
-    return s[:max_len] if s else ''
+    s = re.sub(r"[^A-Za-z0-9_-]", "", str(s))
+    return s[:max_len] if s else ""
+
 
 import sys
 import time
@@ -212,15 +215,42 @@ def market_min_amount(market: Dict[str, Any]) -> Optional[float]:
     return safe_float((limits.get("amount") or {}).get("min"), None)
 
 
-def fetch_with_retry(fn: Callable, log_fn: Callable[[str, str], None], attempts: int = 3, delay_seconds: float = 1.5):
-    last_err = None
+def is_time_skew_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "timestamp" in msg or "nonce" in msg or "recvwindow" in msg
+
+
+def sync_time_difference(exchange, log_fn: Callable[[str, str], None]) -> None:
+    if not hasattr(exchange, "load_time_difference"):
+        return
+    try:
+        diff = exchange.load_time_difference()
+        log_fn("INFO", f"Synced time difference with exchange ({diff} ms).")
+    except Exception as sync_err:
+        log_fn("WARN", f"Time sync failed: {sync_err}")
+
+
+def fetch_with_retry(
+    fn: Callable,
+    log_fn: Callable[[str, str], None],
+    attempts: int = 3,
+    delay_seconds: float = 1.5,
+    on_error: Optional[Callable[[Exception, int], None]] = None,
+):
+    last_err: Optional[Exception] = None
     for i in range(attempts):
         try:
             return fn()
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
             last_err = e
-            log_fn("WARN", f"Retry {i+1}/{attempts} after error: {e}")
-            time.sleep(delay_seconds * (1.5 ** i))
+            if on_error:
+                try:
+                    on_error(e, i)
+                except Exception:
+                    pass
+            sleep_for = delay_seconds * (2 ** i)
+            log_fn("WARN", f"Retry {i + 1}/{attempts} in {sleep_for:.2f}s after error: {e}")
+            time.sleep(sleep_for)
     if last_err:
         raise last_err
 
@@ -401,16 +431,29 @@ def execute_order(
     max_fallback_slippage_bps = float(execution_cfg.get("max_fallback_slippage_bps", 12.0))
     price_offset_bps = float(execution_cfg.get("maker_price_offset_bps", 0.0))
 
-# XRP: do NOT send newClientOrderId (Binance rejects it)
-params_common = {}
-
+    # XRP: do NOT send newClientOrderId (Binance rejects it)
+    params_common: Dict[str, Any] = {}
 
     if mode == "market_only":
-        return (fetch_with_retry(lambda: place_market(exchange, symbol, side, amount, dry_run, params_common), log_fn), "market")
+        return (
+            fetch_with_retry(
+                lambda: place_market(exchange, symbol, side, amount, dry_run, params_common),
+                log_fn,
+                on_error=lambda e, i: sync_time_difference(exchange, log_fn) if is_time_skew_error(e) else None,
+            ),
+            "market",
+        )
 
-        bid, ask = get_best_bid_ask(exchange, symbol)
+    bid, ask = get_best_bid_ask(exchange, symbol)
     if bid is None or ask is None:
-        return (fetch_with_retry(lambda: place_market(exchange, symbol, side, amount, dry_run, params_common), log_fn), "market")
+        return (
+            fetch_with_retry(
+                lambda: place_market(exchange, symbol, side, amount, dry_run, params_common),
+                log_fn,
+                on_error=lambda e, i: sync_time_difference(exchange, log_fn) if is_time_skew_error(e) else None,
+            ),
+            "market",
+        )
 
     # choose maker price that stays on maker side
     if side == "buy":
@@ -424,11 +467,22 @@ params_common = {}
     maker_params.update({"timeInForce": "GTX", "postOnly": True})
 
     try:
-        order = fetch_with_retry(lambda: place_limit_postonly(exchange, symbol, side, amount, px, dry_run, maker_params), log_fn)
+        order = fetch_with_retry(
+            lambda: place_limit_postonly(exchange, symbol, side, amount, px, dry_run, maker_params),
+            log_fn,
+            on_error=lambda e, i: sync_time_difference(exchange, log_fn) if is_time_skew_error(e) else None,
+        )
     except ccxt.ExchangeError as e:
         log_fn("WARN", f"Maker order rejected ({side}) @ {px}: {e}")
         if fallback_to_market:
-            return (fetch_with_retry(lambda: place_market(exchange, symbol, side, amount, dry_run, params_common), log_fn), "market")
+            return (
+                fetch_with_retry(
+                    lambda: place_market(exchange, symbol, side, amount, dry_run, params_common),
+                    log_fn,
+                    on_error=lambda err, i: sync_time_difference(exchange, log_fn) if is_time_skew_error(err) else None,
+                ),
+                "market",
+            )
         raise
 
     oid = order.get("id")
@@ -463,7 +517,14 @@ params_common = {}
             if move_bps > max_fallback_slippage_bps:
                 raise RuntimeError(f"Fallback slippage too high: {move_bps:.1f} bps > {max_fallback_slippage_bps}")
 
-    return (fetch_with_retry(lambda: place_market(exchange, symbol, side, amount, dry_run, params_common), log_fn), "market")
+    return (
+        fetch_with_retry(
+            lambda: place_market(exchange, symbol, side, amount, dry_run, params_common),
+            log_fn,
+            on_error=lambda e, i: sync_time_difference(exchange, log_fn) if is_time_skew_error(e) else None,
+        ),
+        "market",
+    )
 
 
 # ---------- sizing ----------
@@ -553,13 +614,13 @@ def resolve_paths(cfg: Dict[str, Any]) -> Tuple[str, str, str]:
 
     state_file = str(runtime.get("state_file") or f"state_{sid}.json")
     journal_file = str(runtime.get("journal_file") or f"trade_journal_{sid}.csv")
-    log_file = str(runtime.get("log_file") or os.path.join(log_dir, f"bot_{sid}.log"))
+    log_file = str(runtime.get("log_file") or os.path.join(log_dir, "bot.log"))
 
     return state_file, journal_file, log_file
 
 
 def validate_config(cfg: Dict[str, Any]) -> None:
-    required_sections = ["exchange", "trading", "strategy", "risk", "fees", "guardrails", "execution", "runtime", "misc"]
+    required_sections = ["exchange", "trading", "strategy", "risk", "fees", "guardrails", "execution", "runtime"]
     for sec in required_sections:
         if sec not in cfg:
             raise ValueError(f"Missing config section: {sec}")
@@ -775,7 +836,19 @@ def main():
     state = load_state(state_file, slots=max_positions)
 
     exchange = make_exchange(cfg)
-    markets = fetch_with_retry(lambda: exchange.load_markets(), log, attempts=max_retries, delay_seconds=retry_delay)
+    sync_time_difference(exchange, log)
+
+    def retry_callback(err: Exception, attempt: int) -> None:
+        if is_time_skew_error(err):
+            sync_time_difference(exchange, log)
+
+    markets = fetch_with_retry(
+        lambda: exchange.load_markets(),
+        log,
+        attempts=max_retries,
+        delay_seconds=retry_delay,
+        on_error=retry_callback,
+    )
     if symbol not in markets:
         raise RuntimeError(f"Symbol not available: {symbol}")
     market = markets[symbol]
@@ -821,6 +894,16 @@ def main():
         "last_action_ts_ms": 0,
     }
 
+    last_error_alert_ms = 0
+    error_alert_cooldown_ms = 60_000
+
+    def send_error_alert(text: str) -> None:
+        nonlocal last_error_alert_ms
+        now_ms_local = int(time.time() * 1000)
+        if now_ms_local - last_error_alert_ms >= error_alert_cooldown_ms:
+            tg_send(cfg, text)
+            last_error_alert_ms = now_ms_local
+
     def count_open_positions() -> int:
         return sum(1 for p in state["positions"] if p.get("open"))
 
@@ -860,6 +943,7 @@ def main():
                 log,
                 attempts=max_retries,
                 delay_seconds=retry_delay,
+                on_error=retry_callback,
             )
             if not ohlcv or len(ohlcv) < max(ma_fast, ma_mid, ma_slow) + 5:
                 log("WARN", "Waiting for enough candles to compute moving averages...")
@@ -889,7 +973,13 @@ def main():
             last_close = float(last_closed[4])
             prev_close = float(prev_closed[4])
 
-            ticker = fetch_with_retry(lambda: exchange.fetch_ticker(symbol), log, attempts=max_retries, delay_seconds=retry_delay)
+            ticker = fetch_with_retry(
+                lambda: exchange.fetch_ticker(symbol),
+                log,
+                attempts=max_retries,
+                delay_seconds=retry_delay,
+                on_error=retry_callback,
+            )
             last_price = float(ticker["last"])
 
             # persist candle cursor early
@@ -906,6 +996,7 @@ def main():
                 log,
                 attempts=max_retries,
                 delay_seconds=retry_delay,
+                on_error=retry_callback,
             )
 
             # ---- manage exits for each open position ----
@@ -1046,6 +1137,12 @@ def main():
                     stats["trades"] += 1
                     stats["pnl_quote"] += float(pnl_est)
                     stats["last_action_ts_ms"] = now_ms
+
+                    summary_line = (
+                        f"===== SESSION SUMMARY ===== trades={stats['trades']} wins={stats['wins']} losses={stats['losses']} "
+                        f"pnl≈{stats['pnl_quote']:.4f} {quote}"
+                    )
+                    log("INFO", summary_line)
 
                     duration_s = (now_ms - opened_ms) / 1000.0
                     journal_row(
@@ -1318,18 +1415,22 @@ def main():
 
         except ccxt.NetworkError as e:
             log("WARN", f"Network error: {e}")
-            time.sleep(3)
+            send_error_alert(f"⚠️ Network issue: {e}")
+            time.sleep(min(30, retry_delay * 2))
         except ccxt.ExchangeError as e:
             log("WARN", f"Exchange error: {e}")
-            time.sleep(3)
+            if is_time_skew_error(e):
+                sync_time_difference(exchange, log)
+            send_error_alert(f"⚠️ Exchange issue: {e}")
+            time.sleep(min(30, retry_delay * 2))
         except KeyboardInterrupt:
             log("WARN", "Stopping bot (Ctrl+C).")
             tg_send(cfg, "🛑 BOTV12 stopped by user.")
             sys.exit(0)
         except Exception as e:
             log("ERROR", f"Unexpected error: {repr(e)}")
-            tg_send(cfg, f"❌ BOTV12 error: {repr(e)}")
-            time.sleep(3)
+            send_error_alert(f"❌ BOTV12 error: {repr(e)}")
+            time.sleep(min(30, retry_delay * 2))
 
 
 if __name__ == "__main__":
